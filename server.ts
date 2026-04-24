@@ -2,6 +2,25 @@ import express from 'express';
 import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import Razorpay from 'razorpay';
+import crypto from 'crypto';
+
+let razorpayClient: Razorpay | null = null;
+function getRazorpay() {
+  if (!razorpayClient) {
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) {
+      console.warn('RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET is missing. Payments will not work.');
+      return null;
+    }
+    razorpayClient = new Razorpay({
+      key_id: keyId,
+      key_secret: keySecret
+    });
+  }
+  return razorpayClient;
+}
 
 // In-memory user storage
 const users: any[] = [];
@@ -13,6 +32,62 @@ async function startServer() {
 
   app.use(cors());
   app.use(express.json());
+
+  // 1. RAZORPAY ORDER CREATION
+  app.post("/api/create-order", async (req, res) => {
+    const razorpay = getRazorpay();
+    if (!razorpay) {
+      return res.status(500).json({ error: "Razorpay is not configured on this server." });
+    }
+
+    const { planName, price, currency = 'INR' } = req.body;
+    
+    // Clean price string like '₹199' to numeric 199
+    const amount = parseInt(String(price).replace(/[^0-9]/g, '')) * 100; // Razorpay expects paise
+
+    try {
+      const options = {
+        amount: amount,
+        currency: currency,
+        receipt: `receipt_${Date.now()}`,
+        notes: {
+          planName: planName
+        }
+      };
+
+      const order = await razorpay.orders.create(options);
+      res.json({ 
+        orderId: order.id, 
+        amount: order.amount, 
+        currency: order.currency,
+        keyId: process.env.RAZORPAY_KEY_ID
+      });
+    } catch (error: any) {
+      console.error('[Razorpay Order Error]', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // 1.1 RAZORPAY VERIFICATION
+  app.post("/api/verify-payment", async (req, res) => {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const key_secret = process.env.RAZORPAY_KEY_SECRET;
+
+    if (!key_secret) {
+      return res.status(500).json({ error: "Razorpay secret key missing" });
+    }
+
+    const generated_signature = crypto
+      .createHmac('sha256', key_secret)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest('hex');
+
+    if (generated_signature === razorpay_signature) {
+      res.json({ status: 'success', message: 'Payment verified successfully' });
+    } else {
+      res.status(400).json({ status: 'failure', message: 'Invalid signature' });
+    }
+  });
 
   // 2. TEST ROUTE
   app.get("/api/health", (req, res) => {
